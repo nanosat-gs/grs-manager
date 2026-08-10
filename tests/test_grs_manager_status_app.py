@@ -1,3 +1,5 @@
+import json
+
 from grs_manager.domain.models import RotorPosition
 from grs_manager.status.app import create_app
 
@@ -82,3 +84,34 @@ def test_status_page_shows_placeholder_when_no_target_yet():
 
     assert "nenhum comando recebido ainda" in body
     assert "sem leitura" in body
+
+
+def test_status_page_subscribes_to_events_stream():
+    app = create_app(FakeRotctldServer(True), FakeStationManagerClient(None))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert 'new EventSource("/events")' in body
+
+
+def test_events_stream_sends_current_status_as_first_message():
+    server = FakeRotctldServer(True, last_target=(10.0, 20.0))
+    client = FakeStationManagerClient(RotorPosition(10.0, 20.0))
+    app = create_app(server, client)
+
+    # buffered=False mantém o generator preguiçoso -- não espera a resposta
+    # inteira (que nunca termina, o stream é infinito) antes de retornar.
+    response = app.test_client().get("/events", buffered=False)
+
+    assert response.mimetype == "text/event-stream"
+    chunk = next(response.response)
+    payload = chunk.decode() if isinstance(chunk, bytes) else chunk
+    data = json.loads(payload.removeprefix("data: ").strip())
+
+    assert data == {
+        "gpredict_connected": True,
+        "gpredict_last_target": {"azimuth_degrees": 10.0, "elevation_degrees": 20.0},
+        "rotor_connected": True,
+        "rotor_position": {"azimuth_degrees": 10.0, "elevation_degrees": 20.0},
+    }
+    response.close()

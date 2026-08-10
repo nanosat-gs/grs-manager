@@ -49,7 +49,11 @@ def main() -> None:
         status_app = create_app(server, status_client)
         status_thread = threading.Thread(
             target=status_app.run,
-            kwargs={"host": args.status_host, "port": args.status_port, "debug": False, "use_reloader": False},
+            # threaded=True é essencial aqui: a conexão SSE (/events) fica aberta
+            # indefinidamente: sem isso, ela travaria qualquer outra requisição
+            # (inclusive a própria página / na primeira visita de outra aba).
+            kwargs={"host": args.status_host, "port": args.status_port, "debug": False,
+                    "use_reloader": False, "threaded": True},
             daemon=True,
         )
         status_thread.start()

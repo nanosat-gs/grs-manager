@@ -8,6 +8,11 @@ Manager: `get_position()` só tem sucesso se a cadeia inteira (Station
 Manager -> Rotor Manager -> rotor físico/simulado) estiver respondendo, e o
 valor devolvido é a posição atual do rotor.
 
+A página `/` recebe atualizações ao vivo via Server-Sent Events (`/events`)
+— uma única direção (servidor -> navegador), sem precisar de nenhuma
+dependência nova (Flask/Werkzeug já suportam respostas em stream) nem da
+complexidade de WebSocket bidirecional, que não é necessária aqui.
+
 Usa um StationManagerZmqClient dedicado (separado do que atende o gpredict de
 verdade) — assim, uma checagem de saúde que dê timeout não deixa o socket REQ
 usado pelo tráfego real do gpredict num estado inconsistente (ver limitação
@@ -16,13 +21,18 @@ documentada em `grs_manager.adapters.station_manager_zmq`).
 
 from __future__ import annotations
 
-from flask import Flask
+import json
+import time
+from collections.abc import Iterator
+
+from flask import Flask, Response
 
 from grs_manager.adapters.station_manager_zmq import StationManagerZmqClient
 from grs_manager.domain.models import RotorPosition
 from grs_manager.rotctld.server import RotctldServer
 
 POSITION_DECIMALS = 2
+SSE_INTERVAL_SECONDS = 2
 
 
 def create_app(rotctld_server: RotctldServer, station_manager_client: StationManagerZmqClient) -> Flask:
@@ -34,8 +44,7 @@ def create_app(rotctld_server: RotctldServer, station_manager_client: StationMan
         except Exception:
             return None
 
-    @app.get("/health")
-    def health():
+    def current_status() -> dict[str, object]:
         target = rotctld_server.last_target_from_gpredict
         position = rotor_position()
         return {
@@ -45,16 +54,22 @@ def create_app(rotctld_server: RotctldServer, station_manager_client: StationMan
             "rotor_position": _position_to_dict(position),
         }
 
+    @app.get("/health")
+    def health():
+        return current_status()
+
+    @app.get("/events")
+    def events():
+        def stream() -> Iterator[str]:
+            while True:
+                yield f"data: {json.dumps(current_status())}\n\n"
+                time.sleep(SSE_INTERVAL_SECONDS)
+
+        return Response(stream(), mimetype="text/event-stream")
+
     @app.get("/")
     def status():
-        target = rotctld_server.last_target_from_gpredict
-        position = rotor_position()
-        return _render_page(
-            gpredict_connected=rotctld_server.is_gpredict_connected,
-            gpredict_target=target,
-            rotor_connected=position is not None,
-            rotor_position=position,
-        )
+        return _render_page(**current_status())
 
     return app
 
@@ -72,43 +87,16 @@ def _position_to_dict(position: RotorPosition | None) -> dict[str, float] | None
     return {"azimuth_degrees": position.azimuth_degrees, "elevation_degrees": position.elevation_degrees}
 
 
-def _format_az_el(azimuth: float, elevation: float) -> str:
-    return f"az {azimuth:.{POSITION_DECIMALS}f}°  el {elevation:.{POSITION_DECIMALS}f}°"
-
-
-def _status_row(label: str, active: bool, detail: str | None) -> str:
-    state = "ativo" if active else "inativo"
-    dot_class = "dot-on" if active else "dot-off"
-    detail_html = f'<div class="detail">{detail}</div>' if detail else ""
-    return f"""
-      <div class="row">
-        <span class="dot {dot_class}"></span>
-        <div class="row-text">
-          <div class="row-top">
-            <span class="label">{label}</span>
-            <span class="state {dot_class}">{state}</span>
-          </div>
-          {detail_html}
-        </div>
-      </div>"""
-
-
 def _render_page(
     gpredict_connected: bool,
-    gpredict_target: tuple[float, float] | None,
+    gpredict_last_target: dict[str, float] | None,
     rotor_connected: bool,
-    rotor_position: RotorPosition | None,
+    rotor_position: dict[str, float] | None,
 ) -> str:
-    gpredict_detail = _format_az_el(*gpredict_target) if gpredict_target else "nenhum comando recebido ainda"
-    rotor_detail = (
-        _format_az_el(rotor_position.azimuth_degrees, rotor_position.elevation_degrees)
-        if rotor_position else "sem leitura"
-    )
     return f"""<!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
 <title>GRS Manager — Status</title>
 <style>
   :root {{ color-scheme: light dark; }}
@@ -127,15 +115,17 @@ def _render_page(
   .row + .row {{ border-top: 1px solid #eee; }}
   .row-text {{ flex: 1; }}
   .row-top {{ display: flex; align-items: center; }}
-  .dot {{ width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; margin-top: 0.3rem; }}
+  .dot {{ width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; margin-top: 0.3rem; transition: background-color 0.2s; }}
   .dot-on {{ background: #2ecc71; }}
   .dot-off {{ background: #e74c3c; }}
   .label {{ flex: 1; font-size: 0.95rem; }}
-  .state {{ font-weight: 700; font-size: 0.8rem; letter-spacing: 0.03em; text-transform: uppercase; }}
+  .state {{ font-weight: 700; font-size: 0.8rem; letter-spacing: 0.03em; text-transform: uppercase; transition: color 0.2s; }}
   .state.dot-on {{ color: #2ecc71; background: none; }}
   .state.dot-off {{ color: #e74c3c; background: none; }}
   .detail {{ font-size: 0.85rem; color: #888; margin-top: 0.15rem; font-variant-numeric: tabular-nums; }}
-  footer {{ margin-top: 1.5rem; font-size: 0.75rem; color: #999; }}
+  footer {{ margin-top: 1.5rem; font-size: 0.75rem; color: #999; display: flex; align-items: center; gap: 0.4rem; }}
+  .live-dot {{ width: 6px; height: 6px; border-radius: 50%; background: #2ecc71; }}
+  .live-dot.stale {{ background: #999; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #18191a; color: #e4e6eb; }}
     .card {{ background: #242526; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }}
@@ -148,9 +138,57 @@ def _render_page(
 <body>
   <div class="card">
     <h1>GRS Manager — Status da ponte de rotor</h1>
-    {_status_row("gpredict (Satellite Tracker)", gpredict_connected, gpredict_detail)}
-    {_status_row("Rotor (via Station Manager)", rotor_connected, rotor_detail)}
-    <footer>Atualiza a cada 5s</footer>
+    {_status_row("gpredict", "gpredict (Satellite Tracker)", gpredict_connected, gpredict_last_target, "nenhum comando recebido ainda")}
+    {_status_row("rotor", "Rotor (via Station Manager)", rotor_connected, rotor_position, "sem leitura")}
+    <footer><span id="live-dot" class="live-dot"></span><span id="live-label">ao vivo</span></footer>
   </div>
+<script>
+  function fmt(values) {{
+    return values ? `az ${{values.azimuth_degrees.toFixed(2)}}°  el ${{values.elevation_degrees.toFixed(2)}}°` : null;
+  }}
+  function applyRow(id, active, values, placeholder) {{
+    const dot = document.getElementById(id + "-dot");
+    const state = document.getElementById(id + "-state");
+    const detail = document.getElementById(id + "-detail");
+    dot.className = "dot " + (active ? "dot-on" : "dot-off");
+    state.className = "state " + (active ? "dot-on" : "dot-off");
+    state.textContent = active ? "ativo" : "inativo";
+    detail.textContent = fmt(values) || placeholder;
+  }}
+  const liveDot = document.getElementById("live-dot");
+  const liveLabel = document.getElementById("live-label");
+  const source = new EventSource("/events");
+  source.onmessage = (event) => {{
+    const data = JSON.parse(event.data);
+    applyRow("gpredict", data.gpredict_connected, data.gpredict_last_target, "nenhum comando recebido ainda");
+    applyRow("rotor", data.rotor_connected, data.rotor_position, "sem leitura");
+    liveDot.classList.remove("stale");
+    liveLabel.textContent = "ao vivo";
+  }};
+  source.onerror = () => {{
+    liveDot.classList.add("stale");
+    liveLabel.textContent = "conexão perdida, tentando reconectar...";
+  }};
+</script>
 </body>
 </html>"""
+
+
+def _status_row(row_id: str, label: str, active: bool, values: dict[str, float] | None, placeholder: str) -> str:
+    state = "ativo" if active else "inativo"
+    dot_class = "dot-on" if active else "dot-off"
+    detail = (
+        f"az {values['azimuth_degrees']:.{POSITION_DECIMALS}f}°  el {values['elevation_degrees']:.{POSITION_DECIMALS}f}°"
+        if values else placeholder
+    )
+    return f"""
+      <div class="row">
+        <span id="{row_id}-dot" class="dot {dot_class}"></span>
+        <div class="row-text">
+          <div class="row-top">
+            <span class="label">{label}</span>
+            <span id="{row_id}-state" class="state {dot_class}">{state}</span>
+          </div>
+          <div id="{row_id}-detail" class="detail">{detail}</div>
+        </div>
+      </div>"""
