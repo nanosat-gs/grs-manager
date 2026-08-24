@@ -4,10 +4,20 @@ from grs_manager.domain.models import RotorPosition
 from grs_manager.status.app import create_app
 
 
-class FakeRotctldServer:
-    def __init__(self, connected, last_target=None):
-        self.is_gpredict_connected = connected
-        self.last_target_from_gpredict = last_target
+class FakeStationData:
+    """Substitui o acesso ao banco: os testes são sobre o painel, não sobre SQL."""
+
+    def __init__(self, snapshot=None, detail=None):
+        self._snapshot = snapshot or {"satellites": [], "database_available": True}
+        self._detail = detail
+
+    def snapshot(self):
+        return self._snapshot
+
+    def satellite_detail(self, code):
+        if self._detail is None or self._detail.get("code") != code:
+            return None
+        return self._detail
 
 
 class FakeStationManagerClient:
@@ -20,74 +30,48 @@ class FakeStationManagerClient:
         return self._position
 
 
-def test_health_reports_both_active_with_values():
-    server = FakeRotctldServer(True, last_target=(90.0, 20.0))
-    client = FakeStationManagerClient(RotorPosition(90.0, 20.0))
-    app = create_app(server, client)
+# --- Rotor -----------------------------------------------------------------
+
+
+def test_health_reports_rotor_active_with_position():
+    app = create_app(FakeStationManagerClient(RotorPosition(90.0, 20.0)))
 
     response = app.test_client().get("/health")
 
     assert response.get_json() == {
-        "gpredict_connected": True,
-        "gpredict_last_target": {"azimuth_degrees": 90.0, "elevation_degrees": 20.0},
         "rotor_connected": True,
         "rotor_position": {"azimuth_degrees": 90.0, "elevation_degrees": 20.0},
     }
 
 
 def test_health_reports_rotor_inactive_when_station_manager_unreachable():
-    server = FakeRotctldServer(True)
-    client = FakeStationManagerClient(None)
-    app = create_app(server, client)
+    app = create_app(FakeStationManagerClient(None))
 
     response = app.test_client().get("/health")
 
-    assert response.get_json() == {
-        "gpredict_connected": True,
-        "gpredict_last_target": None,
-        "rotor_connected": False,
-        "rotor_position": None,
-    }
+    assert response.get_json() == {"rotor_connected": False, "rotor_position": None}
 
 
-def test_health_reports_gpredict_disconnected_with_no_target_yet():
-    server = FakeRotctldServer(False)
-    client = FakeStationManagerClient(RotorPosition(0.0, 0.0))
-    app = create_app(server, client)
-
-    response = app.test_client().get("/health")
-
-    assert response.get_json()["gpredict_connected"] is False
-    assert response.get_json()["gpredict_last_target"] is None
-
-
-def test_status_page_renders_values():
-    server = FakeRotctldServer(True, last_target=(123.4, 56.7))
-    client = FakeStationManagerClient(RotorPosition(123.0, 57.0))
-    app = create_app(server, client)
+def test_status_page_renders_rotor_position():
+    app = create_app(FakeStationManagerClient(RotorPosition(123.0, 57.0)))
 
     body = app.test_client().get("/").get_data(as_text=True)
 
-    assert "123.40" in body
-    assert "56.70" in body
     assert "123.00" in body
     assert "57.00" in body
     assert "ativo" in body
 
 
-def test_status_page_shows_placeholder_when_no_target_yet():
-    server = FakeRotctldServer(False)
-    client = FakeStationManagerClient(None)
-    app = create_app(server, client)
+def test_status_page_shows_placeholder_when_rotor_has_no_reading():
+    app = create_app(FakeStationManagerClient(None))
 
     body = app.test_client().get("/").get_data(as_text=True)
 
-    assert "nenhum comando recebido ainda" in body
     assert "sem leitura" in body
 
 
 def test_status_page_subscribes_to_events_stream():
-    app = create_app(FakeRotctldServer(True), FakeStationManagerClient(None))
+    app = create_app(FakeStationManagerClient(None))
 
     body = app.test_client().get("/").get_data(as_text=True)
 
@@ -95,9 +79,7 @@ def test_status_page_subscribes_to_events_stream():
 
 
 def test_events_stream_sends_current_status_as_first_message():
-    server = FakeRotctldServer(True, last_target=(10.0, 20.0))
-    client = FakeStationManagerClient(RotorPosition(10.0, 20.0))
-    app = create_app(server, client)
+    app = create_app(FakeStationManagerClient(RotorPosition(10.0, 20.0)))
 
     # buffered=False mantém o generator preguiçoso -- não espera a resposta
     # inteira (que nunca termina, o stream é infinito) antes de retornar.
@@ -109,9 +91,98 @@ def test_events_stream_sends_current_status_as_first_message():
     data = json.loads(payload.removeprefix("data: ").strip())
 
     assert data == {
-        "gpredict_connected": True,
-        "gpredict_last_target": {"azimuth_degrees": 10.0, "elevation_degrees": 20.0},
         "rotor_connected": True,
         "rotor_position": {"azimuth_degrees": 10.0, "elevation_degrees": 20.0},
     }
     response.close()
+
+
+def test_panel_does_not_report_rotctld_clients():
+    """O rastreamento da estação é próprio: a conexão de um cliente hamlib
+    externo não faz mais parte do fluxo normal e saiu do painel."""
+    app = create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)))
+    client = app.test_client()
+
+    assert "gpredict" not in client.get("/").get_data(as_text=True).lower()
+    assert "gpredict_connected" not in client.get("/health").get_json()
+
+
+# --- Visão de satélites ----------------------------------------------------
+
+
+def _app_with_station_data(station_data):
+    return create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)), station_data)
+
+
+def test_station_endpoint_reports_not_configured_without_database():
+    app = create_app(FakeStationManagerClient(None))
+
+    payload = app.test_client().get("/api/station").get_json()
+
+    assert payload == {"satellites": [], "database_available": False, "configured": False}
+
+
+def test_station_endpoint_returns_satellites():
+    snapshot = {
+        "satellites": [{"name": "FloripaSat-1", "code": "SAT-001", "elevation_degrees": 12.5}],
+        "database_available": True,
+    }
+    app = _app_with_station_data(FakeStationData(snapshot=snapshot))
+
+    payload = app.test_client().get("/api/station").get_json()
+
+    assert payload["configured"] is True
+    assert payload["satellites"][0]["code"] == "SAT-001"
+
+
+def test_station_endpoint_survives_database_outage():
+    """Banco fora do ar é estado a exibir, não erro HTTP: a página precisa
+    continuar mostrando o rotor."""
+    app = _app_with_station_data(
+        FakeStationData(snapshot={"satellites": [], "database_available": False})
+    )
+
+    response = app.test_client().get("/api/station")
+
+    assert response.status_code == 200
+    assert response.get_json()["database_available"] is False
+
+
+def test_rotor_health_is_unaffected_by_missing_database():
+    app = create_app(FakeStationManagerClient(RotorPosition(1.0, 2.0)))
+
+    assert app.test_client().get("/health").get_json()["rotor_connected"] is True
+
+
+def test_satellite_detail_returns_payload_for_known_code():
+    detail = {"code": "SAT-001", "name": "FloripaSat-1", "norad_id": 44885, "scheduling": []}
+    app = _app_with_station_data(FakeStationData(detail=detail))
+
+    payload = app.test_client().get("/api/satellite/SAT-001").get_json()
+
+    assert payload["name"] == "FloripaSat-1"
+    assert payload["norad_id"] == 44885
+
+
+def test_satellite_detail_is_404_for_unknown_code():
+    app = _app_with_station_data(FakeStationData(detail={"code": "SAT-001"}))
+
+    assert app.test_client().get("/api/satellite/NOPE").status_code == 404
+
+
+def test_satellite_detail_is_404_without_database():
+    app = create_app(FakeStationManagerClient(None))
+
+    assert app.test_client().get("/api/satellite/SAT-001").status_code == 404
+
+
+def test_status_page_shows_rotor_alongside_satellite_grid():
+    """A visão de satélites é adição, não substituição: o painel de rotor
+    continua sendo a razão de existir desta página."""
+    app = create_app(FakeStationManagerClient(RotorPosition(123.0, 57.0)))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert "123.00" in body
+    assert 'id="sat-grid"' in body
+    assert 'id="modal"' in body

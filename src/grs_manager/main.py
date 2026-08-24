@@ -15,6 +15,7 @@ import threading
 from grs_manager.adapters.station_manager_zmq import StationManagerZmqClient
 from grs_manager.rotctld.server import RotctldServer
 from grs_manager.status.app import create_app
+from grs_manager.status import station_data as station_data_module
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4533
@@ -44,9 +45,13 @@ def main() -> None:
     server = RotctldServer(args.host, args.port, service)
 
     status_client = None
+    station_data = None
     if not args.no_status:
         status_client = StationManagerZmqClient(args.station_manager_address, timeout_ms=STATUS_ZMQ_TIMEOUT_MS)
-        status_app = create_app(server, status_client)
+        # Opcional de propósito: sem PG_DATABASE_URL o painel é só a ponte do
+        # rotor, que é o que o GRS Manager precisa ser capaz de fazer sozinho.
+        station_data = station_data_module.from_environment()
+        status_app = create_app(status_client, station_data)
         status_thread = threading.Thread(
             target=status_app.run,
             # threaded=True é essencial aqui: a conexão SSE (/events) fica aberta
@@ -71,6 +76,8 @@ def main() -> None:
         service.close()
         if status_client is not None:
             status_client.close()
+        if station_data is not None:
+            station_data.close()
 
 
 if __name__ == "__main__":
