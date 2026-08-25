@@ -65,6 +65,17 @@ _PASSES_SQL = """
     ORDER BY p.aos_time
 """
 
+# Só quem tem NORAD ID entra na revalidação: um satélite de TLE manual não tem
+# o que buscar no catálogo, e um sem dado orbital nenhum não é rastreável.
+_TRACKABLE_SQL = """
+    SELECT s.id, s.name, s.code, s.norad_id,
+           (s.tle_line1 IS NOT NULL AND s.tle_line2 IS NOT NULL) AS has_manual_tle
+    FROM satellites s
+    WHERE s.norad_id IS NOT NULL
+       OR (s.tle_line1 IS NOT NULL AND s.tle_line2 IS NOT NULL)
+    ORDER BY s.name
+"""
+
 _SATELLITE_BY_CODE_SQL = """
     SELECT s.id, s.name, s.code, s.status, s.norad_id, s.tle_line1, s.tle_line2,
            ts.azimuth_deg, ts.elevation_deg, ts.range_km, ts.is_visible,
@@ -240,6 +251,55 @@ class StationData:
             "unscheduled_telecommands": by_pass.get(None, []),
         }
 
+    # --- Revalidação dos dados orbitais -------------------------------------
+
+    def refresh_orbital_data(self) -> dict[str, Any]:
+        """Rebusca no CelesTrak os elementos de todos os satélites rastreáveis.
+
+        É a única operação do painel que escreve alguma coisa — e escreve no
+        cache de TLE (o volume compartilhado), nunca no banco. A regra continua
+        de pé: quem escreve no Postgres é só o TC Scheduler. Como o cache é o
+        mesmo volume que o Scheduler lê, o plano seguinte já sai com os
+        elementos novos, sem que os dois processos precisem se conhecer.
+
+        Um satélite que falha não interrompe os outros: o resultado traz uma
+        linha por satélite, e a página mostra quem deu certo e quem não deu.
+        """
+        from sqlalchemy import text
+
+        try:
+            with self._engine.connect() as conn:
+                satellites = [dict(r) for r in conn.execute(text(_TRACKABLE_SQL)).mappings()]
+        except Exception as error:
+            logger.warning("Sem lista de satélites para revalidar: %s", error)
+            return {"database_available": False, "results": []}
+
+        from spacelab_tracking import get_orbital_data
+
+        results = []
+        for satellite in satellites:
+            # TLE manual é decisão explícita de operador e não vem do catálogo:
+            # rebuscá-lo sobrescreveria justamente o que se quis fixar.
+            if satellite["has_manual_tle"]:
+                results.append(_refresh_result(satellite, "skipped", "TLE manual, não vem do catálogo"))
+                continue
+            try:
+                data = get_orbital_data(satellite["norad_id"], force_update=True)
+            except Exception as error:
+                logger.warning("Falha ao revalidar %s: %s", satellite["code"], error)
+                results.append(_refresh_result(satellite, "failed", str(error)))
+                continue
+
+            # O Satrec em memória foi construído dos elementos antigos: mantê-lo
+            # faria o painel seguir mostrando a posição que se acabou de trocar.
+            with self._cache_lock:
+                self._satrec_cache.pop(satellite["code"], None)
+            results.append(_refresh_result(satellite, "updated", None, source=data.source))
+
+        updated = sum(1 for r in results if r["status"] == "updated")
+        logger.info("Revalidação de TLE: %d de %d atualizados", updated, len(results))
+        return {"database_available": True, "results": results, "updated": updated}
+
     def _live_position(self, satellite: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Vetor de estado e ponto subsatélite agora, ou None se não dá para propagar."""
         try:
@@ -364,6 +424,19 @@ def _telecommand_to_dict(telecommand: dict[str, Any]) -> dict[str, Any]:
         "command_type": telecommand["command_type"],
         "status": telecommand["status"],
         "priority": telecommand["priority"],
+    }
+
+
+def _refresh_result(
+    satellite: dict[str, Any], status: str, message: Optional[str], source: Optional[str] = None
+) -> dict[str, Any]:
+    return {
+        "name": satellite["name"],
+        "code": satellite["code"],
+        "norad_id": satellite["norad_id"],
+        "status": status,
+        "message": message,
+        "source": source,
     }
 
 

@@ -7,9 +7,11 @@ from grs_manager.status.app import create_app
 class FakeStationData:
     """Substitui o acesso ao banco: os testes são sobre o painel, não sobre SQL."""
 
-    def __init__(self, snapshot=None, detail=None):
+    def __init__(self, snapshot=None, detail=None, refresh=None):
         self._snapshot = snapshot or {"satellites": [], "database_available": True}
         self._detail = detail
+        self._refresh = refresh or {"database_available": True, "results": [], "updated": 0}
+        self.refresh_calls = 0
 
     def snapshot(self):
         return self._snapshot
@@ -18,6 +20,10 @@ class FakeStationData:
         if self._detail is None or self._detail.get("code") != code:
             return None
         return self._detail
+
+    def refresh_orbital_data(self):
+        self.refresh_calls += 1
+        return self._refresh
 
 
 class FakeStationManagerClient:
@@ -186,3 +192,47 @@ def test_status_page_shows_rotor_alongside_satellite_grid():
     assert "123.00" in body
     assert 'id="sat-grid"' in body
     assert 'id="modal"' in body
+
+
+# --- Revalidação de TLE ----------------------------------------------------
+
+
+def test_refresh_endpoint_reports_what_was_updated():
+    refresh = {
+        "database_available": True,
+        "updated": 1,
+        "results": [
+            {"name": "FloripaSat-1", "code": "SAT-001", "norad_id": 44885,
+             "status": "updated", "message": None, "source": "omm"},
+        ],
+    }
+    station_data = FakeStationData(refresh=refresh)
+    app = _app_with_station_data(station_data)
+
+    payload = app.test_client().post("/api/tle/refresh").get_json()
+
+    assert station_data.refresh_calls == 1
+    assert payload["updated"] == 1
+    assert payload["results"][0]["status"] == "updated"
+
+
+def test_refresh_endpoint_is_post_only():
+    """Muda estado (o cache de TLE): um GET seria disparado por prefetch."""
+    app = _app_with_station_data(FakeStationData())
+
+    assert app.test_client().get("/api/tle/refresh").status_code == 405
+
+
+def test_refresh_endpoint_is_404_without_database():
+    app = create_app(FakeStationManagerClient(None))
+
+    assert app.test_client().post("/api/tle/refresh").status_code == 404
+
+
+def test_page_offers_the_refresh_button():
+    app = create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert 'id="refresh-tle"' in body
+    assert '/api/tle/refresh' in body

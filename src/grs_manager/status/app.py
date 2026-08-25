@@ -94,6 +94,17 @@ def create_app(
             return jsonify({"satellites": [], "database_available": False, "configured": False})
         return jsonify({**station_data.snapshot(), "configured": True})
 
+    @app.post("/api/tle/refresh")
+    def refresh_tle():
+        """Revalida os elementos orbitais no CelesTrak, sem esperar o cache expirar.
+
+        POST porque muda estado (o cache de TLE compartilhado) — um GET aqui
+        seria revalidado por qualquer prefetch de navegador.
+        """
+        if station_data is None:
+            return jsonify({"error": "painel sem acesso ao banco"}), 404
+        return jsonify(station_data.refresh_orbital_data())
+
     @app.get("/api/satellite/<code>")
     def satellite(code: str):
         if station_data is None:
@@ -140,7 +151,9 @@ def _render_page(
       <div class="section-head">
         <h2>Satélites</h2>
         <span id="sat-meta" class="muted"></span>
+        <button id="refresh-tle" class="action" type="button">Atualizar TLE</button>
       </div>
+      <div id="refresh-report" class="refresh-report" hidden></div>
       <div id="sat-grid" class="grid">
         <p class="muted">Carregando…</p>
       </div>
@@ -250,7 +263,23 @@ _PAGE_CSS = """
 
   .section-head { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.9rem; }
   h2 { font-size: 1.05rem; margin: 0; font-weight: 600; }
-  .section-head .muted { font-size: 0.8rem; }
+  .section-head .muted { font-size: 0.8rem; flex: 1; }
+  .action {
+    background: none; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--accent); font: inherit; font-size: 0.82rem; padding: 0.35rem 0.8rem;
+    cursor: pointer; transition: border-color 0.15s;
+  }
+  .action:hover:not(:disabled) { border-color: var(--accent); }
+  .action:disabled { color: var(--muted); cursor: progress; }
+  .refresh-report {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+    padding: 0.8rem 1rem; margin-bottom: 0.9rem; font-size: 0.85rem;
+  }
+  .refresh-report[hidden] { display: none; }
+  .refresh-report ul { margin: 0.5rem 0 0; padding-left: 1.1rem; color: var(--muted); }
+  .refresh-report li { margin-bottom: 0.15rem; }
+  .refresh-report .failed { color: var(--bad); }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 1rem; }
 
   .sat {
@@ -643,6 +672,47 @@ function renderModal(detail) {
     });
   }
 }
+
+// --- Revalidação de TLE ---------------------------------------------------
+
+const refreshButton = document.getElementById("refresh-tle");
+const refreshReport = document.getElementById("refresh-report");
+
+function reportLine(result) {
+  if (result.status === "updated") return `${result.name}: atualizado (${result.source})`;
+  if (result.status === "skipped") return `${result.name}: ${result.message}`;
+  return `<span class="failed">${result.name}: ${result.message}</span>`;
+}
+
+refreshButton.addEventListener("click", async () => {
+  refreshButton.disabled = true;
+  refreshButton.textContent = "Buscando no CelesTrak…";
+  refreshReport.hidden = false;
+  refreshReport.innerHTML = "<strong>Revalidando elementos orbitais…</strong>";
+
+  try {
+    const response = await fetch("/api/tle/refresh", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "falha na revalidação");
+
+    const results = data.results || [];
+    if (results.length === 0) {
+      refreshReport.innerHTML = "<strong>Nenhum satélite com dados orbitais para atualizar.</strong>";
+    } else {
+      refreshReport.innerHTML =
+        `<strong>${data.updated} de ${results.length} atualizados no CelesTrak.</strong>` +
+        `<ul>${results.map((r) => `<li>${reportLine(r)}</li>`).join("")}</ul>`;
+    }
+    // O Scheduler lê o mesmo cache: as posições da grade acompanham no ciclo
+    // dele, mas o modal já abre com os elementos novos.
+    refreshGrid();
+  } catch (error) {
+    refreshReport.innerHTML = `<span class="failed">Não foi possível atualizar: ${error.message}</span>`;
+  } finally {
+    refreshButton.disabled = false;
+    refreshButton.textContent = "Atualizar TLE";
+  }
+});
 
 refreshGrid();
 setInterval(refreshGrid, REFRESH_MS);
