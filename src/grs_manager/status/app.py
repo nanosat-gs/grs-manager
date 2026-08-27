@@ -7,8 +7,9 @@ posição atual do rotor.
 
 A página junta duas perguntas que o operador faz ao mesmo tempo: "para onde a
 antena está apontada" (o rotor, daqui mesmo) e "para onde ela deveria estar
-apontada" (satélites e plano de passagens, lidos do banco por `station_data`).
-A segunda metade é opcional: sem PG_DATABASE_URL o painel mostra só o rotor.
+apontada" (satélites e plano de passagens, pedidos ao TC Scheduler por
+`scheduler_client`). A segunda metade é opcional: sem TC_SCHEDULER_API_URL, ou
+com o Scheduler parado, o painel mostra só o rotor.
 
 Não reporta o estado do servidor rotctld. Ele continua de pé na porta 4533 para
 quem quiser assumir a antena por um cliente hamlib, mas o rastreamento da
@@ -47,7 +48,8 @@ SSE_INTERVAL_SECONDS = 2
 # Criar e editar telecomando é função do TC Generator: ele já tem os
 # formulários, a validação e a sessão de operador. O painel manda o operador
 # para lá em vez de duplicar isso — e, principalmente, em vez de dar ao GRS
-# Manager uma escrita no banco que a arquitetura reserva ao TC Scheduler.
+# Manager uma escrita no banco que a arquitetura reserva ao TC Scheduler —
+# banco que, aliás, este serviço não alcança mais nem para ler.
 # O endereço é resolvido pelo navegador do operador, não pelo container, então
 # o default é localhost e não o nome do serviço no compose.
 TC_GENERATOR_URL = os.getenv("TC_GENERATOR_URL", "http://localhost:5000")
@@ -87,9 +89,9 @@ def create_app(
 
     @app.get("/api/station")
     def station():
-        """Satélites e próximas passagens. 200 mesmo sem banco: a página
-        precisa distinguir "não configurado" de "falhou", e nenhum dos dois é
-        erro do cliente."""
+        """Satélites e próximas passagens. 200 mesmo sem o Scheduler: a
+        página precisa distinguir "não configurado" de "falhou", e nenhum dos
+        dois é erro do cliente."""
         if station_data is None:
             return jsonify({"satellites": [], "database_available": False, "configured": False})
         return jsonify({**station_data.snapshot(), "configured": True})
@@ -102,13 +104,13 @@ def create_app(
         seria revalidado por qualquer prefetch de navegador.
         """
         if station_data is None:
-            return jsonify({"error": "painel sem acesso ao banco"}), 404
+            return jsonify({"error": "painel sem acesso ao TC Scheduler"}), 404
         return jsonify(station_data.refresh_orbital_data())
 
     @app.get("/api/satellite/<code>")
     def satellite(code: str):
         if station_data is None:
-            return jsonify({"error": "painel sem acesso ao banco"}), 404
+            return jsonify({"error": "painel sem acesso ao TC Scheduler"}), 404
         detail = station_data.satellite_detail(code)
         if detail is None:
             return jsonify({"error": f"satélite {code} não encontrado"}), 404
@@ -452,8 +454,8 @@ function renderGrid(payload) {
   satellites = payload.satellites || [];
 
   if (payload.configured === false) {
-    grid.innerHTML = `<p class="notice">Painel sem acesso ao banco: defina PG_DATABASE_URL
-      no serviço grs-manager para ver satélites e agendamentos.</p>`;
+    grid.innerHTML = `<p class="notice">Painel sem acesso ao TC Scheduler: defina
+      TC_SCHEDULER_API_URL no serviço grs-manager para ver satélites e agendamentos.</p>`;
     meta.textContent = "";
     return;
   }
@@ -617,11 +619,11 @@ function expandedPassBlock(passes) {
 }
 
 function renderModal(detail) {
-  // O banco pode cair entre a grade e o clique: aí o detalhe volta sem
+  // O Scheduler pode cair entre a grade e o clique: aí o detalhe volta sem
   // nenhuma das listas, e insistir em renderizá-las quebraria o modal.
   if (detail.database_available === false) {
     document.getElementById("modal-body").innerHTML =
-      `<p class="notice">Banco indisponível. Tente de novo em instantes.</p>`;
+      `<p class="notice">Plano da estação indisponível. Tente de novo em instantes.</p>`;
     return;
   }
 

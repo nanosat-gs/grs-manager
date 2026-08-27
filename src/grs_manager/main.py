@@ -15,7 +15,7 @@ import threading
 from grs_manager.adapters.station_manager_zmq import StationManagerZmqClient
 from grs_manager.rotctld.server import RotctldServer
 from grs_manager.status.app import create_app
-from grs_manager.status import station_data as station_data_module
+from grs_manager.status import scheduler_client
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4533
@@ -48,9 +48,12 @@ def main() -> None:
     station_data = None
     if not args.no_status:
         status_client = StationManagerZmqClient(args.station_manager_address, timeout_ms=STATUS_ZMQ_TIMEOUT_MS)
-        # Opcional de propósito: sem PG_DATABASE_URL o painel é só a ponte do
-        # rotor, que é o que o GRS Manager precisa ser capaz de fazer sozinho.
-        station_data = station_data_module.from_environment()
+        # Opcional de propósito: sem TC_SCHEDULER_API_URL o painel é só a
+        # ponte do rotor, que é o que o GRS Manager precisa ser capaz de fazer
+        # sozinho. O nome da variável local continua `station_data` porque é o
+        # papel que ela cumpre para o painel — só a fonte mudou, de uma
+        # conexão com o Postgres para uma requisição ao TC Scheduler.
+        station_data = scheduler_client.from_environment()
         status_app = create_app(status_client, station_data)
         status_thread = threading.Thread(
             target=status_app.run,
