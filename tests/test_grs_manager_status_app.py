@@ -236,3 +236,27 @@ def test_page_offers_the_refresh_button():
 
     assert 'id="refresh-tle"' in body
     assert '/api/tle/refresh' in body
+
+
+def test_page_uses_the_station_manager_dashboard_shell():
+    """O painel do operador é a interface do Station Manager (identidade e
+    layout da Laura), servida por template e alimentada pelos endpoints daqui."""
+    app = create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert "<title>SpaceLab Station Manager</title>" in body
+    assert 'data-view="satellites"' in body and 'data-view="passes"' in body
+    assert 'id="passesView"' in body
+
+
+def test_page_links_telecommand_editing_to_the_tc_generator():
+    """Criar/editar TC continua sendo do TC Generator: o painel só aponta para
+    lá (o GRS Manager não escreve no banco)."""
+    from grs_manager.status.app import TC_GENERATOR_URL
+
+    app = create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert f'const TC_GENERATOR_URL = "{TC_GENERATOR_URL}"' in body
