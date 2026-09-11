@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grs-manager"
+version = "0.2.0"
+description = "Painel do operador e ponte rotctld para a estação terrestre SpaceLab"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Três dependências, e nenhuma git URL. Este serviço não propaga órbita (quem
+# faz isso é o TC Scheduler, e ele entrega o resultado pronto), então não
+# precisa da spacelab-tracking; e não abre banco, então não precisa de
+# SQLAlchemy nem psycopg2.
+#
+# pyzmq é dependência direta, e não extra: sem ZMQ o GRS Manager não fala com o
+# Station Manager, e aí não faz nada. O extra `zmq` do monorepo era artefato de
+# os três serviços compartilharem um pyproject.
+dependencies = [
+    "Flask>=3.0,<4.0",
+    "pyzmq>=25,<26",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# O painel é servido de um template Jinja; sem isto ele não entra no wheel
+# (só funcionaria em instalação editável).
+[tool.setuptools.package-data]
+grs_manager = ["status/templates/*.html"]
