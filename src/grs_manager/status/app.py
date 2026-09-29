@@ -11,6 +11,11 @@ apontada" (satélites e plano de passagens, pedidos ao TC Scheduler por
 `scheduler_client`). A segunda metade é opcional: sem TC_SCHEDULER_API_URL, ou
 com o Scheduler parado, o painel mostra só o rotor.
 
+A aba Previsão é a única parte que escreve: pular, forçar ou desfazer uma
+passagem, e ligar a recepção ou cadastrar a frequência de downlink de um
+satélite. Mesmo assim o painel não toca no banco — repassa ao Scheduler, que
+guarda a decisão e replaneja em segundos.
+
 Não reporta o estado do servidor rotctld. Ele continua de pé na porta 4533 para
 quem quiser assumir a antena por um cliente hamlib, mas o rastreamento da
 estação é próprio (TC Scheduler decide, Station Manager aponta) — e um painel
@@ -37,10 +42,15 @@ import time
 from collections.abc import Iterator
 from typing import Any, Optional
 
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
 
 from grs_manager.adapters.station_manager_zmq import StationManagerZmqClient
 from grs_manager.domain.models import RotorPosition
+from grs_manager.status.scheduler_client import (
+    SatelliteNotFound,
+    SchedulerRejected,
+    SchedulerUnavailable,
+)
 
 SSE_INTERVAL_SECONDS = 2
 
@@ -114,6 +124,48 @@ def create_app(
         if detail is None:
             return jsonify({"error": f"satélite {code} não encontrado"}), 404
         return jsonify(detail)
+
+    @app.get("/api/passes")
+    def passes():
+        """Passagens previstas no horizonte, escolhidas ou não. 200 mesmo sem o
+        Scheduler, pelo mesmo motivo de `/api/station`."""
+        if station_data is None:
+            return jsonify({"passes": [], "reception": [], "computed_at": None,
+                            "database_available": False, "configured": False})
+        return jsonify({**station_data.passes(), "configured": True})
+
+    def operator_action(action):
+        """Repassa uma ação do operador e traduz o que o Scheduler respondeu.
+
+        Os três desfechos de erro chegam à tela com códigos diferentes: 400 é o
+        operador que precisa corrigir o pedido (a mensagem do Scheduler vai
+        como está), 404 é satélite que não existe, 503 é a estação sem acesso.
+        """
+        if station_data is None:
+            return jsonify({"error": "painel sem acesso ao TC Scheduler"}), 503
+        try:
+            return jsonify(action())
+        except SchedulerRejected as error:
+            return jsonify({"error": str(error)}), 400
+        except SatelliteNotFound as error:
+            return jsonify({"error": str(error)}), 404
+        except SchedulerUnavailable:
+            return jsonify({"error": "TC Scheduler indisponível; a ação não foi aplicada"}), 503
+
+    @app.put("/api/satellites/<code>/reception")
+    def reception(code: str):
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "esperava um objeto JSON"}), 400
+        return operator_action(lambda: station_data.set_reception(code, body))
+
+    @app.put("/api/passes/decision")
+    def decision():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not body.get("satellite_code") or not body.get("aos"):
+            return jsonify({"error": "informe satellite_code e aos"}), 400
+        return operator_action(lambda: station_data.set_decision(
+            body["satellite_code"], body["aos"], body.get("decision")))
 
     @app.get("/")
     def status():

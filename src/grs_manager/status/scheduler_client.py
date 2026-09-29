@@ -11,10 +11,17 @@ banco tenha um dono só: quem escreve o plano é quem o serve. O GRS Manager é 
 que já valia para o Station Manager, e pela mesma razão (ele precisa poder
 rodar longe do banco).
 
-Os métodos são exatamente os que o painel já consumia (`snapshot`,
-`satellite_detail`, `refresh_orbital_data`, `close`), e os dicionários de falha
-são idênticos aos que a versão de banco devolvia quando o Postgres caía. É o
-que faz `status.app` não precisar saber que a fonte mudou.
+Os métodos de leitura são exatamente os que o painel já consumia
+(`snapshot`, `satellite_detail`, `refresh_orbital_data`, `close`), e os
+dicionários de falha são idênticos aos que a versão de banco devolvia quando o
+Postgres caía. É o que faz `status.app` não precisar saber que a fonte mudou.
+
+As ações do operador sobre passagens (`set_reception`, `set_decision`) são a
+única escrita que o painel faz, e também passam pelo Scheduler: ele continua
+sendo o único a gravar o plano. Ao contrário das leituras, elas não degradam
+para um dicionário — levantam. Uma leitura que falha vira "sem acesso" na
+tela; uma escrita que falha em silêncio faria o operador achar que pulou uma
+passagem que o rotor vai seguir mesmo assim.
 
 Opcional de propósito, como antes. Sem TC_SCHEDULER_API_URL, ou com o Scheduler
 parado, o painel volta a ser exatamente o controle de rotor — que é o que o GRS
@@ -44,6 +51,10 @@ READ_TIMEOUT = (2, 5)
 # FUNCIONOU num erro na tela, e o operador clicaria de novo.
 REFRESH_TIMEOUT = (2, 120)
 
+# Uma ação do operador é uma linha no banco do Scheduler: rápida. O replanejamento
+# que ela provoca roda depois, no laço do Scheduler, e não prende a resposta.
+WRITE_TIMEOUT = (2, 10)
+
 
 class SchedulerUnavailable(Exception):
     """O Scheduler não respondeu, ou respondeu o que não dá para usar."""
@@ -56,6 +67,14 @@ class SatelliteNotFound(Exception):
     tela — "não encontrado" é uma resposta sobre o satélite, "sem acesso" é uma
     resposta sobre a estação — e tratá-las juntas faria um código digitado
     errado parecer uma falha de infraestrutura.
+    """
+
+
+class SchedulerRejected(Exception):
+    """O Scheduler respondeu 400: o pedido do operador é inválido.
+
+    A mensagem vem do Scheduler e é escrita para o operador ("a frequência vai
+    em Hz, não em MHz"); o painel a repassa como está.
     """
 
 
@@ -73,7 +92,7 @@ def from_environment() -> Optional["SchedulerApiClient"]:
 
 
 class SchedulerApiClient:
-    """Acesso somente-leitura ao plano da estação, por HTTP."""
+    """Acesso ao plano da estação, por HTTP: leitura e ações do operador."""
 
     def __init__(self, base_url: str, session: Optional[Any] = None) -> None:
         self._base_url = base_url.rstrip("/")
@@ -118,18 +137,49 @@ class SchedulerApiClient:
             logger.warning("Falha ao revalidar os TLEs: %s", error)
             return {"database_available": False, "results": []}
 
-    def _request(self, method: str, path: str, timeout: tuple[float, float]) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
+    # --- Passagens previstas e ações do operador ----------------------------
+
+    def passes(self) -> dict[str, Any]:
+        """Todas as passagens do horizonte, escolhidas ou não, e por quê."""
         try:
-            response = self._session.request(method, url, timeout=timeout)
+            return {**self._request("GET", "/api/passes", READ_TIMEOUT), "database_available": True}
+        except (SchedulerUnavailable, SatelliteNotFound, SchedulerRejected) as error:
+            logger.warning("Sem previsão de passagens: %s", error)
+            return {"computed_at": None, "passes": [], "reception": [], "database_available": False}
+
+    def set_reception(self, code: str, changes: dict[str, Any]) -> dict[str, Any]:
+        """Liga/desliga o rastreio de passagens de um satélite e/ou a frequência
+        de downlink (em Hz). Levanta em vez de degradar — ver docstring do módulo."""
+        return self._request("PUT", f"/api/satellites/{quote(code, safe='')}/reception",
+                             WRITE_TIMEOUT, json=changes)
+
+    def set_decision(self, code: str, aos: str, decision: Optional[str]) -> dict[str, Any]:
+        """Pular ("skip"), forçar ("force") ou desfazer (None) uma passagem.
+
+        A passagem é identificada por satélite + AOS previsto, não por id: o
+        Scheduler recria as linhas de passagem a cada replanejamento.
+        """
+        return self._request("PUT", "/api/passes/decision", WRITE_TIMEOUT,
+                             json={"satellite_code": code, "aos": aos, "decision": decision})
+
+    def _request(self, method: str, path: str, timeout: tuple[float, float],
+                 json: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        # Só as escritas levam corpo; as leituras continuam com a mesma chamada
+        # de sempre.
+        kwargs = {"json": json} if json is not None else {}
+        try:
+            response = self._session.request(method, url, timeout=timeout, **kwargs)
         except requests.RequestException as error:
             raise SchedulerUnavailable(str(error)) from error
 
-        # Antes do raise_for_status: 404 aqui é uma resposta com significado,
-        # e deixá-lo virar HTTPError apagaria a diferença entre "não existe" e
-        # "não deu para perguntar".
+        # Antes do raise_for_status: 404 e 400 aqui são respostas com
+        # significado, e deixá-los virar HTTPError apagaria a diferença entre
+        # "não existe", "pedido inválido" e "não deu para perguntar".
         if response.status_code == 404:
-            raise SatelliteNotFound(url)
+            raise SatelliteNotFound(_error_message(response) or url)
+        if response.status_code == 400:
+            raise SchedulerRejected(_error_message(response) or "pedido recusado pelo Scheduler")
 
         try:
             response.raise_for_status()
@@ -139,3 +189,12 @@ class SchedulerApiClient:
 
     def close(self) -> None:
         self._session.close()
+
+
+def _error_message(response: Any) -> Optional[str]:
+    """O campo `error` do corpo, quando o Scheduler mandou um."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body.get("error") if isinstance(body, dict) else None

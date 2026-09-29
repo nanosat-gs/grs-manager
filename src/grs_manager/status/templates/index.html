@@ -181,6 +181,33 @@
   .pass-metric span:first-child { color: var(--muted); }
   .pass button.expand { margin-top: 0.8rem; width: 100%; background: none; border: 1px solid var(--border); border-radius: 8px; color: var(--accent); font: inherit; font-size: 0.8rem; padding: 0.4rem; cursor: pointer; }
   .tc-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.25rem; }
+
+  .chip {
+    display: inline-block; font-size: 0.72rem; padding: 0.15rem 0.55rem; border-radius: 99px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .chip.ok { color: var(--ok); border-color: var(--ok); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .chip.accent { color: var(--accent); border-color: var(--accent); }
+  .chip + .chip { margin-left: 0.3rem; }
+  tr.dim td { color: var(--muted); }
+  .row-actions { display: flex; gap: 0.4rem; justify-content: flex-end; }
+  .row-actions .action { padding: 0.2rem 0.6rem; font-size: 0.75rem; }
+  .action.danger { color: var(--bad); }
+  .action.danger:hover:not(:disabled) { border-color: var(--bad); }
+  .toast { font-size: 0.8rem; margin: 0 0 0.75rem; }
+  .toast.failed { color: var(--bad); }
+  .toast[hidden] { display: none; }
+
+  .reception-form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.5rem; font-size: 0.85rem; }
+  .reception-form label { display: flex; align-items: center; gap: 0.45rem; }
+  .reception-form input[type="number"] {
+    width: 9rem; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.3rem 0.5rem; font: inherit; font-variant-numeric: tabular-nums;
+  }
+  .reception-form input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+  .reception-status { font-size: 0.78rem; color: var(--muted); margin: 0.6rem 0 0; }
+  .reception-status.failed { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -206,6 +233,7 @@
   <div class="tabs">
     <button class="tab active" data-view="satellites">Satélites</button>
     <button class="tab" data-view="passes">Passagens</button>
+    <button class="tab" data-view="forecast">Previsão</button>
   </div>
 
   <main>
@@ -225,6 +253,15 @@
         <span id="pass-meta" class="muted"></span>
       </div>
       <div id="pass-table"><p class="empty">Carregando…</p></div>
+    </section>
+
+    <section id="forecastView" class="panel-view">
+      <div class="section-head">
+        <h2>Previsão de passagens (24 h)</h2>
+        <span id="forecast-meta" class="muted"></span>
+      </div>
+      <p id="forecast-toast" class="toast" hidden></p>
+      <div id="forecast-table"><p class="empty">Carregando…</p></div>
     </section>
   </main>
 
@@ -427,6 +464,155 @@ function tickCountdowns() {
   }
 }
 
+// --- Previsão: todas as passagens candidatas e as decisões do operador ---
+// O Scheduler grava a decisão na hora, mas só replaneja na verificação
+// seguinte (poucos segundos). Por isso a página relê a previsão algumas vezes
+// depois de cada ação, e mostra "replanejando…" enquanto a decisão ainda não
+// virou resultado.
+
+const FORECAST_HOURS = 24;
+const AFTER_ACTION_MS = [1500, 4000, 8000];
+let forecast = null;
+
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function clock(iso) {
+  return iso ? stamp(iso).slice(11, 16) : "—";
+}
+
+function outcomeChips(pass) {
+  const waiting =
+    (pass.decision === "skip" && pass.outcome !== "skipped") ||
+    (pass.decision === "force" && !pass.forced) ||
+    (!pass.decision && (pass.outcome === "skipped" || pass.forced));
+  if (waiting) return `<span class="chip accent">replanejando…</span>`;
+
+  const chips = [];
+  if (pass.outcome === "planned") {
+    chips.push(`<span class="chip ok">planejada</span>`);
+    if (pass.forced) chips.push(`<span class="chip accent">forçada</span>`);
+  } else if (pass.outcome === "conflict") {
+    const winner = pass.lost_to
+      ? `${esc(pass.lost_to.satellite_name)} (${clock(pass.lost_to.aos_time)})` : "outra passagem";
+    chips.push(`<span class="chip warn">perdeu para ${winner}</span>`);
+  } else if (pass.outcome === "skipped") {
+    chips.push(`<span class="chip">pulada</span>`);
+  } else if (pass.outcome === "reception_off") {
+    chips.push(`<span class="chip">recepção desligada</span>`);
+  }
+  if (pass.carries_telecommands && pass.telecommand_count > 0) {
+    chips.push(`<span class="chip">leva ${pass.telecommand_count} TC</span>`);
+  }
+  return chips.join("");
+}
+
+function passActions(pass) {
+  if (new Date(pass.aos_time) <= Date.now()) return `<span class="muted">em andamento</span>`;
+  const key = `data-code="${esc(pass.satellite_code)}" data-aos="${esc(pass.aos_time)}"`;
+  if (pass.decision) return `<button class="action" ${key} data-decision="">Desfazer</button>`;
+  return pass.outcome === "planned"
+    ? `<button class="action danger" ${key} data-decision="skip">Pular</button>`
+    : `<button class="action" ${key} data-decision="force">Forçar</button>`;
+}
+
+function showToast(message, failed) {
+  const toast = document.getElementById("forecast-toast");
+  toast.hidden = !message;
+  toast.className = "toast" + (failed ? " failed" : "");
+  toast.textContent = message || "";
+}
+
+function renderForecast() {
+  const host = document.getElementById("forecast-table");
+  const meta = document.getElementById("forecast-meta");
+  if (!forecast) return;
+  if (forecast.configured === false) {
+    host.innerHTML = `<p class="notice">Painel sem acesso ao TC Scheduler: defina
+      TC_SCHEDULER_API_URL no serviço grs-manager para ver e controlar as passagens.</p>`;
+    meta.textContent = "";
+    return;
+  }
+  if (!forecast.database_available) {
+    host.innerHTML = `<p class="notice">Previsão indisponível: o TC Scheduler não respondeu.
+      As ações sobre passagens ficam fora do ar até ele voltar.</p>`;
+    meta.textContent = "";
+    return;
+  }
+
+  const horizon = Date.now() + FORECAST_HOURS * 3600 * 1000;
+  const rows = (forecast.passes || [])
+    .filter((p) => new Date(p.aos_time) <= horizon)
+    .sort((a, b) => new Date(a.aos_time) - new Date(b.aos_time));
+  const planned = rows.filter((p) => p.outcome === "planned").length;
+  meta.textContent = forecast.computed_at
+    ? `${planned} de ${rows.length} planejadas · calculada às ${clock(forecast.computed_at)}`
+    : "";
+
+  if (rows.length === 0) {
+    host.innerHTML = `<p class="empty">Nenhuma passagem prevista nas próximas ${FORECAST_HOURS} h.
+      Um satélite entra aqui quando está ativo e tem dados orbitais.</p>`;
+    return;
+  }
+  host.innerHTML = `<table>
+    <thead><tr><th>Satélite</th><th>AOS</th><th>LOS</th><th>Elev. máx.</th><th>Situação</th><th></th></tr></thead>
+    <tbody>${rows.map((p) => `
+      <tr class="${p.outcome === "planned" ? "" : "dim"}">
+        <td>${esc(p.satellite_name)} <span class="muted">${esc(p.satellite_code)}</span></td>
+        <td>${stamp(p.aos_time)}</td>
+        <td>${clock(p.los_time)}</td>
+        <td>${num(p.max_elevation_degrees, 1, " °")}</td>
+        <td>${outcomeChips(p)}</td>
+        <td><div class="row-actions">${passActions(p)}</div></td>
+      </tr>`).join("")}</tbody>
+  </table>`;
+  for (const button of host.querySelectorAll("[data-decision]")) {
+    button.addEventListener("click", () => decide(button));
+  }
+}
+
+async function refreshForecast() {
+  try {
+    forecast = await (await fetch("/api/passes")).json();
+  } catch (error) {
+    forecast = { database_available: false, passes: [], reception: [] };
+  }
+  renderForecast();
+}
+
+function refreshAfterAction() {
+  for (const delay of AFTER_ACTION_MS) {
+    setTimeout(() => { refreshForecast(); refreshGrid(); }, delay);
+  }
+}
+
+async function sendAction(url, body) {
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+
+async function decide(button) {
+  const decision = button.dataset.decision || null;
+  button.disabled = true;
+  try {
+    await sendAction("/api/passes/decision",
+      { satellite_code: button.dataset.code, aos: button.dataset.aos, decision });
+    const label = { skip: "pulada", force: "forçada" }[decision] || "de volta ao automático";
+    showToast(`Passagem de ${button.dataset.code} às ${clock(button.dataset.aos)} ${label}. Replanejando…`);
+    await refreshForecast();
+    refreshAfterAction();
+  } catch (error) {
+    showToast(`Não foi possível aplicar: ${error.message}`, true);
+    button.disabled = false;
+  }
+}
+
 // --- Modal de detalhe ------------------------------------------------
 
 const modal = document.getElementById("modal");
@@ -546,6 +732,67 @@ function expandedPassBlock(passes) {
   </div>`;
 }
 
+function receptionBlock(code) {
+  const entry = forecast && (forecast.reception || []).find((r) => r.code === code);
+  if (!entry) {
+    return `<div class="panel"><h3>Recepção</h3>
+      <p class="empty">Controle de passagens indisponível: o TC Scheduler não respondeu.</p></div>`;
+  }
+  const mhz = entry.downlink_frequency_hz ? (entry.downlink_frequency_hz / 1e6).toFixed(4) : "";
+  const tracking = entry.track_passes
+    ? "Toda passagem deste satélite entra no plano, com ou sem telecomando."
+    : "Só passagens com telecomando (ou forçadas) entram no plano.";
+  const tuning = entry.downlink_frequency_hz
+    ? ""
+    : " Sem frequência, o rotor segue a passagem mas o receptor não é sintonizado.";
+  return `<div class="panel"><h3>Recepção</h3>
+    <div class="reception-form">
+      <label><input id="rx-track" type="checkbox" ${entry.track_passes ? "checked" : ""}>
+        Rastrear passagens para recepção</label>
+      <label>Frequência de downlink
+        <input id="rx-freq" type="number" min="1" max="6000" step="0.0001" placeholder="MHz" value="${mhz}"> MHz</label>
+      <button id="rx-save" class="action" type="button">Salvar frequência</button>
+    </div>
+    <p id="rx-status" class="reception-status">${tracking}${tuning}</p>
+  </div>`;
+}
+
+async function saveReception(code, changes) {
+  const status = document.getElementById("rx-status");
+  status.className = "reception-status";
+  status.textContent = "Salvando…";
+  try {
+    await sendAction(`/api/satellites/${encodeURIComponent(code)}/reception`, changes);
+    status.textContent = "Salvo. O Scheduler replaneja em alguns segundos.";
+    await refreshForecast();
+    refreshAfterAction();
+  } catch (error) {
+    status.className = "reception-status failed";
+    status.textContent = `Não foi possível salvar: ${error.message}`;
+  }
+}
+
+function bindReception(code) {
+  const track = document.getElementById("rx-track");
+  if (!track) return;
+  track.addEventListener("change", () => saveReception(code, { track_passes: track.checked }));
+  document.getElementById("rx-save").addEventListener("click", () => {
+    // O campo é em MHz para o operador; o Scheduler guarda em Hz.
+    const raw = document.getElementById("rx-freq").value.trim();
+    // A faixa é conferida aqui, em MHz: o erro provável é digitar em Hz, e a
+    // mensagem do Scheduler (que fala em Hz) confundiria quem digitou em MHz.
+    const mhz = Number(raw);
+    if (raw !== "" && !(Number.isFinite(mhz) && mhz >= 1 && mhz <= 6000)) {
+      const status = document.getElementById("rx-status");
+      status.className = "reception-status failed";
+      status.textContent = "Informe a frequência em MHz, entre 1 e 6000 (ex.: 145.9).";
+      return;
+    }
+    const hz = raw === "" ? null : Math.round(mhz * 1e6);
+    saveReception(code, { downlink_frequency_hz: hz });
+  });
+}
+
 function renderModal(detail) {
   // O Scheduler pode cair entre a grade e o clique: aí o detalhe volta sem
   // nenhuma das listas, e insistir em renderizá-las quebraria o modal.
@@ -574,6 +821,7 @@ function renderModal(detail) {
 
   document.getElementById("modal-body").innerHTML = `
     ${statePanels(detail)}
+    ${receptionBlock(detail.code)}
     <div class="subtabs">
       <button class="subtab ${activeTab === "scheduling" ? "active" : ""}" data-tab="scheduling">Agendamento</button>
       <button class="subtab ${activeTab === "history" ? "active" : ""}" data-tab="history">Histórico (24 h)</button>
@@ -584,6 +832,7 @@ function renderModal(detail) {
     <a class="link" href="${TC_GENERATOR_URL}" target="_blank" rel="noopener">
       Criar ou editar telecomandos no TC Generator ↗</a>`;
 
+  bindReception(detail.code);
   for (const tab of document.querySelectorAll(".subtab")) {
     tab.addEventListener("click", () => {
       activeTab = tab.dataset.tab;
@@ -635,7 +884,9 @@ refreshButton.addEventListener("click", async () => {
 });
 
 refreshGrid();
+refreshForecast();
 setInterval(refreshGrid, REFRESH_MS);
+setInterval(refreshForecast, REFRESH_MS);
 setInterval(tickCountdowns, 1000);
 </script>
 </body>

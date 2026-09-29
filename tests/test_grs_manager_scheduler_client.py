@@ -16,7 +16,12 @@ import pytest
 import requests
 
 from grs_manager.status import scheduler_client
-from grs_manager.status.scheduler_client import SchedulerApiClient
+from grs_manager.status.scheduler_client import (
+    SatelliteNotFound,
+    SchedulerApiClient,
+    SchedulerRejected,
+    SchedulerUnavailable,
+)
 
 
 class FakeResponse:
@@ -44,8 +49,8 @@ class FakeSession:
         self.calls = []
         self.closed = False
 
-    def request(self, method, url, timeout=None):
-        self.calls.append({"method": method, "url": url, "timeout": timeout})
+    def request(self, method, url, timeout=None, **kwargs):
+        self.calls.append({"method": method, "url": url, "timeout": timeout, **kwargs})
         if self._error is not None:
             raise self._error
         return self._response
@@ -185,3 +190,89 @@ def test_respostas_de_falha_sao_serializaveis():
 
     for payload in (client.snapshot(), client.satellite_detail("X"), client.refresh_orbital_data()):
         json.dumps(payload)
+
+
+# --- Previsão de passagens e ações do operador ----------------------------------
+
+
+def test_passes_repassa_a_previsao_e_marca_disponivel():
+    payload = {"computed_at": "2026-09-29T12:00:00+00:00", "passes": [{"satellite_code": "SAT-1"}],
+               "reception": []}
+    session = FakeSession(FakeResponse(payload=payload))
+
+    result = _client(session).passes()
+
+    assert session.calls[0]["url"] == "http://tc-scheduler:5591/api/passes"
+    assert result["passes"] == [{"satellite_code": "SAT-1"}]
+    assert result["database_available"] is True
+
+
+def test_passes_com_scheduler_fora_degrada_para_lista_vazia():
+    session = FakeSession(FakeResponse(status_code=503, payload={"error": "banco indisponível"}))
+
+    assert _client(session).passes() == {
+        "computed_at": None, "passes": [], "reception": [], "database_available": False,
+    }
+
+
+def test_set_reception_manda_put_com_o_corpo():
+    session = FakeSession(FakeResponse(payload={"code": "SAT-1", "track_passes": False}))
+
+    _client(session).set_reception("SAT-1", {"track_passes": False})
+
+    call = session.calls[0]
+    assert call["method"] == "PUT"
+    assert call["url"] == "http://tc-scheduler:5591/api/satellites/SAT-1/reception"
+    assert call["json"] == {"track_passes": False}
+    assert call["timeout"] == scheduler_client.WRITE_TIMEOUT
+
+
+def test_set_decision_identifica_a_passagem_por_satelite_e_aos():
+    """O id da passagem muda a cada replanejamento; satélite + AOS não."""
+    session = FakeSession(FakeResponse(payload={"ok": True}))
+
+    _client(session).set_decision("SAT-1", "2026-09-29T14:03:00+00:00", None)
+
+    assert session.calls[0]["url"].endswith("/api/passes/decision")
+    assert session.calls[0]["json"] == {
+        "satellite_code": "SAT-1", "aos": "2026-09-29T14:03:00+00:00", "decision": None,
+    }
+
+
+def test_leituras_continuam_sem_corpo():
+    session = FakeSession(FakeResponse(payload={"satellites": []}))
+
+    _client(session).snapshot()
+
+    assert "json" not in session.calls[0]
+
+
+def test_400_vira_recusa_com_a_mensagem_do_scheduler():
+    """A mensagem é escrita para o operador; o painel a mostra como está."""
+    session = FakeSession(FakeResponse(
+        status_code=400, payload={"error": "a frequência vai em Hz, não em MHz"}))
+
+    with pytest.raises(SchedulerRejected, match="Hz, não em MHz"):
+        _client(session).set_reception("SAT-1", {"downlink_frequency_hz": 145.9})
+
+
+def test_404_na_escrita_e_satelite_inexistente():
+    session = FakeSession(FakeResponse(status_code=404, payload={"error": "satélite X não encontrado"}))
+
+    with pytest.raises(SatelliteNotFound, match="não encontrado"):
+        _client(session).set_decision("X", "2026-09-29T14:03:00+00:00", "skip")
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        FakeSession(error=requests.ConnectionError("recusou")),
+        FakeSession(FakeResponse(status_code=503, payload={"error": "banco indisponível"})),
+    ],
+    ids=["conexão recusada", "banco fora"],
+)
+def test_escrita_com_scheduler_fora_levanta_em_vez_de_degradar(session):
+    """Uma escrita que falha em silêncio faria o operador achar que pulou uma
+    passagem que o rotor vai seguir mesmo assim."""
+    with pytest.raises(SchedulerUnavailable):
+        _client(session).set_decision("SAT-1", "2026-09-29T14:03:00+00:00", "skip")

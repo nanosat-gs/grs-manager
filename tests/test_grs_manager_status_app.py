@@ -1,7 +1,14 @@
 import json
 
+import pytest
+
 from grs_manager.domain.models import RotorPosition
 from grs_manager.status.app import create_app
+from grs_manager.status.scheduler_client import (
+    SatelliteNotFound,
+    SchedulerRejected,
+    SchedulerUnavailable,
+)
 
 
 class FakeStationData:
@@ -24,6 +31,28 @@ class FakeStationData:
     def refresh_orbital_data(self):
         self.refresh_calls += 1
         return self._refresh
+
+    # Ações do operador: registradas, ou o erro que o teste pedir.
+    action_error = None
+    actions = None
+
+    def passes(self):
+        return {"computed_at": None, "passes": [{"satellite_code": "SAT-001"}],
+                "reception": [], "database_available": True}
+
+    def set_reception(self, code, changes):
+        return self._act(("reception", code, changes))
+
+    def set_decision(self, code, aos, decision):
+        return self._act(("decision", code, aos, decision))
+
+    def _act(self, call):
+        if self.actions is None:
+            self.actions = []
+        self.actions.append(call)
+        if self.action_error is not None:
+            raise self.action_error
+        return {"ok": True}
 
 
 class FakeStationManagerClient:
@@ -260,3 +289,121 @@ def test_page_links_telecommand_editing_to_the_tc_generator():
     body = app.test_client().get("/").get_data(as_text=True)
 
     assert f'const TC_GENERATOR_URL = "{TC_GENERATOR_URL}"' in body
+
+
+# --- Previsão e ações do operador --------------------------------------------
+
+
+def test_passes_endpoint_returns_the_forecast():
+    app = _app_with_station_data(FakeStationData())
+
+    payload = app.test_client().get("/api/passes").get_json()
+
+    assert payload["configured"] is True
+    assert payload["passes"] == [{"satellite_code": "SAT-001"}]
+
+
+def test_passes_endpoint_reports_not_configured_without_scheduler():
+    app = create_app(FakeStationManagerClient(None))
+
+    response = app.test_client().get("/api/passes")
+
+    assert response.status_code == 200
+    assert response.get_json()["configured"] is False
+
+
+def test_decision_is_forwarded_to_the_scheduler():
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/passes/decision", json={
+        "satellite_code": "SAT-001", "aos": "2026-09-29T14:03:00+00:00", "decision": "skip"})
+
+    assert response.status_code == 200
+    assert station_data.actions == [("decision", "SAT-001", "2026-09-29T14:03:00+00:00", "skip")]
+
+
+def test_undo_is_a_null_decision():
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+
+    app.test_client().put("/api/passes/decision", json={
+        "satellite_code": "SAT-001", "aos": "2026-09-29T14:03:00+00:00", "decision": None})
+
+    assert station_data.actions[0][3] is None
+
+
+@pytest.mark.parametrize("body", [None, [], {"aos": "x"}, {"satellite_code": "SAT-001"}])
+def test_decision_without_pass_identity_is_400(body):
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/passes/decision", json=body)
+
+    assert response.status_code == 400
+    assert station_data.actions is None
+
+
+def test_reception_is_forwarded_to_the_scheduler():
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/satellites/SAT-001/reception",
+                                     json={"track_passes": False, "downlink_frequency_hz": 145_900_000})
+
+    assert response.status_code == 200
+    assert station_data.actions == [
+        ("reception", "SAT-001", {"track_passes": False, "downlink_frequency_hz": 145_900_000})]
+
+
+@pytest.mark.parametrize(
+    "error, status",
+    [
+        (SchedulerRejected("a frequência vai em Hz, não em MHz"), 400),
+        (SatelliteNotFound("satélite NOPE não encontrado"), 404),
+        (SchedulerUnavailable("recusou"), 503),
+    ],
+    ids=["pedido inválido", "satélite inexistente", "scheduler fora"],
+)
+def test_operator_action_errors_keep_their_meaning(error, status):
+    """Os três desfechos são coisas diferentes na tela: corrigir o pedido,
+    conferir o código, ou esperar a estação voltar."""
+    station_data = FakeStationData()
+    station_data.action_error = error
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/satellites/SAT-001/reception", json={"track_passes": True})
+
+    assert response.status_code == status
+    assert response.get_json()["error"]
+
+
+def test_rejection_message_reaches_the_operator_verbatim():
+    station_data = FakeStationData()
+    station_data.action_error = SchedulerRejected("a frequência vai em Hz, não em MHz")
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/satellites/SAT-001/reception",
+                                     json={"downlink_frequency_hz": 145.9})
+
+    assert response.get_json() == {"error": "a frequência vai em Hz, não em MHz"}
+
+
+def test_operator_actions_are_503_without_scheduler():
+    app = create_app(FakeStationManagerClient(None))
+    client = app.test_client()
+
+    assert client.put("/api/passes/decision", json={
+        "satellite_code": "SAT-001", "aos": "x", "decision": "skip"}).status_code == 503
+    assert client.put("/api/satellites/SAT-001/reception",
+                      json={"track_passes": True}).status_code == 503
+
+
+def test_page_offers_the_forecast_tab():
+    app = create_app(FakeStationManagerClient(RotorPosition(0.0, 0.0)))
+
+    body = app.test_client().get("/").get_data(as_text=True)
+
+    assert 'data-view="forecast"' in body and 'id="forecastView"' in body
+    assert "/api/passes/decision" in body
+    assert "Rastrear passagens para recepção" in body
