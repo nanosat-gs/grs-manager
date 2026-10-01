@@ -207,6 +207,17 @@
   }
   .reception-form input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
   .reception-status { font-size: 0.78rem; color: var(--muted); margin: 0.6rem 0 0; }
+  .dl-table { margin-top: 0.8rem; }
+  .dl-table td { padding: 0.35rem 0.4rem; vertical-align: middle; }
+  .dl-table input[type="text"], .dl-table input[type="number"] {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.25rem 0.45rem; font: inherit; font-size: 0.82rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .dl-table input[type="text"] { width: 9rem; }
+  .dl-table input[type="number"] { width: 8rem; }
+  .dl-table input[type="checkbox"] { accent-color: var(--accent); }
+  .dl-actions { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
   .reception-status.failed { color: var(--bad); }
 </style>
 </head>
@@ -623,6 +634,7 @@ let expandedPass = null;
 function closeModal() {
   modal.hidden = true;
   openCode = null;
+  downlinkDraft = null;
 }
 modal.addEventListener("click", (event) => {
   if (event.target.hasAttribute("data-close")) closeModal();
@@ -732,65 +744,150 @@ function expandedPassBlock(passes) {
   </div>`;
 }
 
+// Rascunho da lista de downlinks em edição: o modal é redesenhado ao trocar
+// de subaba, e sem isto a edição não salva sumiria.
+let downlinkDraft = null;
+
+function receptionEntry(code) {
+  return forecast && (forecast.reception || []).find((r) => r.code === code);
+}
+
+function radioCell(saved) {
+  if (!saved) return `<span class="muted">salve para ver</span>`;
+  if (saved.radio) return `<span class="chip ok">rádio ${esc(saved.radio)}</span>`;
+  return `<span class="chip warn" title="${esc(saved.issue || "")}">${esc(saved.issue || "sem rádio")}</span>`;
+}
+
+function downlinkRows(code, entry) {
+  const saved = entry.downlinks || [];
+  const rows = downlinkDraft && downlinkDraft.code === code
+    ? downlinkDraft.rows
+    : saved.map((d) => ({ name: d.name, mhz: (d.frequency_hz / 1e6).toFixed(4), enabled: d.enabled }));
+  if (rows.length === 0) {
+    return `<p class="empty">Nenhum downlink: o rotor segue a passagem, mas nenhum receptor é sintonizado.</p>`;
+  }
+  return `<table class="dl-table"><thead><tr><th>Nome</th><th>Frequência</th><th>Ligado</th><th>Quem ouve</th><th></th></tr></thead>
+    <tbody>${rows.map((row, i) => {
+      const match = saved.find((d) => d.name === row.name
+        && Math.abs(d.frequency_hz / 1e6 - Number(row.mhz)) < 1e-6 && d.enabled === row.enabled);
+      return `<tr data-row="${i}">
+        <td><input type="text" data-field="name" value="${esc(row.name)}" placeholder="beacon"></td>
+        <td><input type="number" data-field="mhz" min="1" max="6000" step="0.0001" value="${esc(row.mhz)}" placeholder="MHz"> MHz</td>
+        <td><input type="checkbox" data-field="enabled" ${row.enabled ? "checked" : ""}></td>
+        <td>${radioCell(match)}</td>
+        <td><button class="action danger" type="button" data-remove="${i}">Remover</button></td>
+      </tr>`;
+    }).join("")}</tbody></table>`;
+}
+
 function receptionBlock(code) {
-  const entry = forecast && (forecast.reception || []).find((r) => r.code === code);
+  const entry = receptionEntry(code);
   if (!entry) {
     return `<div class="panel"><h3>Recepção</h3>
       <p class="empty">Controle de passagens indisponível: o TC Scheduler não respondeu.</p></div>`;
   }
-  const mhz = entry.downlink_frequency_hz ? (entry.downlink_frequency_hz / 1e6).toFixed(4) : "";
   const tracking = entry.track_passes
     ? "Toda passagem deste satélite entra no plano, com ou sem telecomando."
     : "Só passagens com telecomando (ou forçadas) entram no plano.";
-  const tuning = entry.downlink_frequency_hz
-    ? ""
-    : " Sem frequência, o rotor segue a passagem mas o receptor não é sintonizado.";
+  const radios = (forecast.radios || []).map((r) =>
+    `${esc(r.name)} ${(r.min_hz / 1e6).toFixed(0)}–${(r.max_hz / 1e6).toFixed(0)} MHz`).join(" · ");
   return `<div class="panel"><h3>Recepção</h3>
     <div class="reception-form">
       <label><input id="rx-track" type="checkbox" ${entry.track_passes ? "checked" : ""}>
         Rastrear passagens para recepção</label>
-      <label>Frequência de downlink
-        <input id="rx-freq" type="number" min="1" max="6000" step="0.0001" placeholder="MHz" value="${mhz}"> MHz</label>
-      <button id="rx-save" class="action" type="button">Salvar frequência</button>
     </div>
-    <p id="rx-status" class="reception-status">${tracking}${tuning}</p>
+    <p class="reception-status">${tracking}</p>
+    <h3 style="margin-top:1rem">Downlinks</h3>
+    <p class="reception-status">Cada portadora do satélite é ouvida pelo rádio da sua faixa
+      ${radios ? `(${radios})` : "(a estação não declara rádios: só o primeiro downlink ligado é ouvido)"}.
+      A ordem importa: numa faixa com dois downlinks, fica o primeiro.</p>
+    <div id="dl-rows">${downlinkRows(code, entry)}</div>
+    <div class="dl-actions">
+      <button id="dl-add" class="action" type="button">Adicionar downlink</button>
+      <button id="dl-save" class="action" type="button">Salvar downlinks</button>
+    </div>
+    <p id="rx-status" class="reception-status"></p>
   </div>`;
 }
 
-async function saveReception(code, changes) {
+function readDownlinkRows() {
+  return [...document.querySelectorAll("#dl-rows tr[data-row]")].map((tr) => ({
+    name: tr.querySelector('[data-field="name"]').value.trim(),
+    mhz: tr.querySelector('[data-field="mhz"]').value.trim(),
+    enabled: tr.querySelector('[data-field="enabled"]').checked,
+  }));
+}
+
+function showStatus(text, failed) {
   const status = document.getElementById("rx-status");
-  status.className = "reception-status";
-  status.textContent = "Salvando…";
+  if (!status) return;
+  status.className = "reception-status" + (failed ? " failed" : "");
+  status.textContent = text;
+}
+
+async function saveTrack(code, track) {
+  showStatus("Salvando…");
   try {
-    await sendAction(`/api/satellites/${encodeURIComponent(code)}/reception`, changes);
-    status.textContent = "Salvo. O Scheduler replaneja em alguns segundos.";
+    await sendAction(`/api/satellites/${encodeURIComponent(code)}/reception`, { track_passes: track });
+    showStatus("Salvo. O Scheduler replaneja em alguns segundos.");
     await refreshForecast();
     refreshAfterAction();
   } catch (error) {
-    status.className = "reception-status failed";
-    status.textContent = `Não foi possível salvar: ${error.message}`;
+    showStatus(`Não foi possível salvar: ${error.message}`, true);
   }
 }
 
-function bindReception(code) {
-  const track = document.getElementById("rx-track");
-  if (!track) return;
-  track.addEventListener("change", () => saveReception(code, { track_passes: track.checked }));
-  document.getElementById("rx-save").addEventListener("click", () => {
-    // O campo é em MHz para o operador; o Scheduler guarda em Hz.
-    const raw = document.getElementById("rx-freq").value.trim();
-    // A faixa é conferida aqui, em MHz: o erro provável é digitar em Hz, e a
-    // mensagem do Scheduler (que fala em Hz) confundiria quem digitou em MHz.
-    const mhz = Number(raw);
-    if (raw !== "" && !(Number.isFinite(mhz) && mhz >= 1 && mhz <= 6000)) {
-      const status = document.getElementById("rx-status");
-      status.className = "reception-status failed";
-      status.textContent = "Informe a frequência em MHz, entre 1 e 6000 (ex.: 145.9).";
+async function saveDownlinks(code, rerender) {
+  const rows = readDownlinkRows();
+  // Conferido aqui, em MHz: o erro provável é digitar em Hz, e a mensagem do
+  // Scheduler (que fala em Hz) confundiria quem digitou em MHz.
+  for (const row of rows) {
+    const mhz = Number(row.mhz);
+    if (!row.name) { showStatus("Dê um nome a cada downlink (ex.: beacon, dados).", true); return; }
+    if (!(row.mhz !== "" && Number.isFinite(mhz) && mhz >= 1 && mhz <= 6000)) {
+      showStatus(`${row.name}: informe a frequência em MHz, entre 1 e 6000 (ex.: 145.9).`, true);
       return;
     }
-    const hz = raw === "" ? null : Math.round(mhz * 1e6);
-    saveReception(code, { downlink_frequency_hz: hz });
+  }
+  showStatus("Salvando…");
+  try {
+    await sendAction(`/api/satellites/${encodeURIComponent(code)}/downlinks`, {
+      downlinks: rows.map((r) => ({
+        name: r.name, frequency_hz: Math.round(Number(r.mhz) * 1e6), enabled: r.enabled,
+      })),
+    });
+    downlinkDraft = null;
+    await refreshForecast();
+    rerender();
+    showStatus("Salvo. Vale a partir da próxima passagem.");
+  } catch (error) {
+    showStatus(`Não foi possível salvar: ${error.message}`, true);
+  }
+}
+
+function bindReception(code, rerender) {
+  const track = document.getElementById("rx-track");
+  if (!track) return;
+  track.addEventListener("change", () => saveTrack(code, track.checked));
+
+  const keepDraft = () => { downlinkDraft = { code, rows: readDownlinkRows() }; };
+  for (const input of document.querySelectorAll("#dl-rows input")) {
+    input.addEventListener("input", keepDraft);
+    input.addEventListener("change", keepDraft);
+  }
+  for (const button of document.querySelectorAll("#dl-rows [data-remove]")) {
+    button.addEventListener("click", () => {
+      const rows = readDownlinkRows();
+      rows.splice(Number(button.dataset.remove), 1);
+      downlinkDraft = { code, rows };
+      rerender();
+    });
+  }
+  document.getElementById("dl-add").addEventListener("click", () => {
+    downlinkDraft = { code, rows: [...readDownlinkRows(), { name: "", mhz: "", enabled: true }] };
+    rerender();
   });
+  document.getElementById("dl-save").addEventListener("click", () => saveDownlinks(code, rerender));
 }
 
 function renderModal(detail) {
@@ -832,7 +929,7 @@ function renderModal(detail) {
     <a class="link" href="${TC_GENERATOR_URL}" target="_blank" rel="noopener">
       Criar ou editar telecomandos no TC Generator ↗</a>`;
 
-  bindReception(detail.code);
+  bindReception(detail.code, () => renderModal(detail));
   for (const tab of document.querySelectorAll(".subtab")) {
     tab.addEventListener("click", () => {
       activeTab = tab.dataset.tab;

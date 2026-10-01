@@ -276,3 +276,15 @@ def test_escrita_com_scheduler_fora_levanta_em_vez_de_degradar(session):
     passagem que o rotor vai seguir mesmo assim."""
     with pytest.raises(SchedulerUnavailable):
         _client(session).set_decision("SAT-1", "2026-09-29T14:03:00+00:00", "skip")
+
+
+def test_set_downlinks_manda_a_lista_inteira():
+    session = FakeSession(FakeResponse(payload={"code": "SAT-1", "downlinks": []}))
+    lista = [{"name": "beacon", "frequency_hz": 145_900_000, "enabled": True}]
+
+    _client(session).set_downlinks("SAT-1", lista)
+
+    call = session.calls[0]
+    assert call["method"] == "PUT"
+    assert call["url"] == "http://tc-scheduler:5591/api/satellites/SAT-1/downlinks"
+    assert call["json"] == {"downlinks": lista}

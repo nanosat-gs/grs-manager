@@ -148,10 +148,16 @@ class SchedulerApiClient:
             return {"computed_at": None, "passes": [], "reception": [], "database_available": False}
 
     def set_reception(self, code: str, changes: dict[str, Any]) -> dict[str, Any]:
-        """Liga/desliga o rastreio de passagens de um satélite e/ou a frequência
-        de downlink (em Hz). Levanta em vez de degradar — ver docstring do módulo."""
+        """Liga/desliga o rastreio de passagens de um satélite. Levanta em vez
+        de degradar — ver docstring do módulo."""
         return self._request("PUT", f"/api/satellites/{quote(code, safe='')}/reception",
                              WRITE_TIMEOUT, json=changes)
+
+    def set_downlinks(self, code: str, downlinks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Substitui a lista de downlinks do satélite ([{name, frequency_hz em
+        Hz, enabled}], em ordem). Cada um é ouvido pelo rádio da sua faixa."""
+        return self._request("PUT", f"/api/satellites/{quote(code, safe='')}/downlinks",
+                             WRITE_TIMEOUT, json={"downlinks": downlinks})
 
     def set_decision(self, code: str, aos: str, decision: Optional[str]) -> dict[str, Any]:
         """Pular ("skip"), forçar ("force") ou desfazer (None) uma passagem.

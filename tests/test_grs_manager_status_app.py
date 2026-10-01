@@ -46,6 +46,9 @@ class FakeStationData:
     def set_decision(self, code, aos, decision):
         return self._act(("decision", code, aos, decision))
 
+    def set_downlinks(self, code, downlinks):
+        return self._act(("downlinks", code, downlinks))
+
     def _act(self, call):
         if self.actions is None:
             self.actions = []
@@ -407,3 +410,26 @@ def test_page_offers_the_forecast_tab():
     assert 'data-view="forecast"' in body and 'id="forecastView"' in body
     assert "/api/passes/decision" in body
     assert "Rastrear passagens para recepção" in body
+    assert "/downlinks" in body and "Adicionar downlink" in body
+
+
+def test_downlinks_are_forwarded_to_the_scheduler():
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+    lista = [{"name": "beacon", "frequency_hz": 145_900_000, "enabled": True}]
+
+    response = app.test_client().put("/api/satellites/SAT-001/downlinks", json={"downlinks": lista})
+
+    assert response.status_code == 200
+    assert station_data.actions == [("downlinks", "SAT-001", lista)]
+
+
+@pytest.mark.parametrize("body", [None, [], {"downlinks": "beacon"}])
+def test_downlinks_without_a_list_is_400(body):
+    station_data = FakeStationData()
+    app = _app_with_station_data(station_data)
+
+    response = app.test_client().put("/api/satellites/SAT-001/downlinks", json=body)
+
+    assert response.status_code == 400
+    assert station_data.actions is None

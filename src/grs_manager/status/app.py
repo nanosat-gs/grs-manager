@@ -12,8 +12,8 @@ apontada" (satélites e plano de passagens, pedidos ao TC Scheduler por
 com o Scheduler parado, o painel mostra só o rotor.
 
 A aba Previsão é a única parte que escreve: pular, forçar ou desfazer uma
-passagem, e ligar a recepção ou cadastrar a frequência de downlink de um
-satélite. Mesmo assim o painel não toca no banco — repassa ao Scheduler, que
+passagem, e ligar a recepção ou cadastrar os downlinks de um satélite (cada
+portadora é ouvida pelo rádio da sua faixa). Mesmo assim o painel não toca no banco — repassa ao Scheduler, que
 guarda a decisão e replaneja em segundos.
 
 Não reporta o estado do servidor rotctld. Ele continua de pé na porta 4533 para
@@ -158,6 +158,13 @@ def create_app(
         if not isinstance(body, dict):
             return jsonify({"error": "esperava um objeto JSON"}), 400
         return operator_action(lambda: station_data.set_reception(code, body))
+
+    @app.put("/api/satellites/<code>/downlinks")
+    def downlinks(code: str):
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("downlinks"), list):
+            return jsonify({"error": 'envie {"downlinks": [...]}'}), 400
+        return operator_action(lambda: station_data.set_downlinks(code, body["downlinks"]))
 
     @app.put("/api/passes/decision")
     def decision():
