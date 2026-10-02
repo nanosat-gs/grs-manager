@@ -411,6 +411,7 @@ def test_page_offers_the_forecast_tab():
     assert "/api/passes/decision" in body
     assert "Rastrear passagens para recepção" in body
     assert "/downlinks" in body and "Adicionar downlink" in body
+    assert "Erro medido" in body and "data-apply" in body
 
 
 def test_downlinks_are_forwarded_to_the_scheduler():

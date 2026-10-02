@@ -758,23 +758,39 @@ function radioCell(saved) {
   return `<span class="chip warn" title="${esc(saved.issue || "")}">${esc(saved.issue || "sem rádio")}</span>`;
 }
 
+// O erro do oscilador que o ajuste fino (bloco FFT) mediu na última
+// passagem. "Aplicar" só corrige o rascunho: quem grava é o operador, no
+// "Salvar" — a frequência cadastrada não muda sozinha.
+function measuredCell(saved, index) {
+  if (!saved || saved.measured_offset_hz === null || saved.measured_offset_hz === undefined) {
+    return `<span class="muted">—</span>`;
+  }
+  const hz = Math.round(saved.measured_offset_hz);
+  const when = saved.measured_at ? stamp(saved.measured_at).slice(0, 16) : "";
+  return `<span class="chip accent" title="medido em ${esc(when)}">${hz >= 0 ? "+" : ""}${hz} Hz</span>
+    <button class="action" type="button" data-apply="${index}" data-offset="${hz}">Aplicar</button>`;
+}
+
 function downlinkRows(code, entry) {
   const saved = entry.downlinks || [];
   const rows = downlinkDraft && downlinkDraft.code === code
     ? downlinkDraft.rows
-    : saved.map((d) => ({ name: d.name, mhz: (d.frequency_hz / 1e6).toFixed(4), enabled: d.enabled }));
+    // 6 casas: 1 Hz. Com 4 (100 Hz), a correção medida pelo ajuste fino
+    // seria arredondada para longe do que foi medido.
+    : saved.map((d) => ({ name: d.name, mhz: (d.frequency_hz / 1e6).toFixed(6), enabled: d.enabled }));
   if (rows.length === 0) {
     return `<p class="empty">Nenhum downlink: o rotor segue a passagem, mas nenhum receptor é sintonizado.</p>`;
   }
-  return `<table class="dl-table"><thead><tr><th>Nome</th><th>Frequência</th><th>Ligado</th><th>Quem ouve</th><th></th></tr></thead>
+  return `<table class="dl-table"><thead><tr><th>Nome</th><th>Frequência</th><th>Ligado</th><th>Quem ouve</th><th>Erro medido</th><th></th></tr></thead>
     <tbody>${rows.map((row, i) => {
       const match = saved.find((d) => d.name === row.name
         && Math.abs(d.frequency_hz / 1e6 - Number(row.mhz)) < 1e-6 && d.enabled === row.enabled);
       return `<tr data-row="${i}">
         <td><input type="text" data-field="name" value="${esc(row.name)}" placeholder="beacon"></td>
-        <td><input type="number" data-field="mhz" min="1" max="6000" step="0.0001" value="${esc(row.mhz)}" placeholder="MHz"> MHz</td>
+        <td><input type="number" data-field="mhz" min="1" max="6000" step="any" value="${esc(row.mhz)}" placeholder="MHz"> MHz</td>
         <td><input type="checkbox" data-field="enabled" ${row.enabled ? "checked" : ""}></td>
         <td>${radioCell(match)}</td>
+        <td>${measuredCell(match, i)}</td>
         <td><button class="action danger" type="button" data-remove="${i}">Remover</button></td>
       </tr>`;
     }).join("")}</tbody></table>`;
@@ -798,6 +814,8 @@ function receptionBlock(code) {
     </div>
     <p class="reception-status">${tracking}</p>
     <h3 style="margin-top:1rem">Downlinks</h3>
+    <p class="reception-status">"Erro medido" é o desvio do oscilador do satélite que o ajuste fino
+      achou na última passagem; "Aplicar" o soma à frequência (no rascunho).</p>
     <p class="reception-status">Cada portadora do satélite é ouvida pelo rádio da sua faixa
       ${radios ? `(${radios})` : "(a estação não declara rádios: só o primeiro downlink ligado é ouvido)"}.
       A ordem importa: numa faixa com dois downlinks, fica o primeiro.</p>
@@ -881,6 +899,16 @@ function bindReception(code, rerender) {
       rows.splice(Number(button.dataset.remove), 1);
       downlinkDraft = { code, rows };
       rerender();
+    });
+  }
+  for (const button of document.querySelectorAll("#dl-rows [data-apply]")) {
+    button.addEventListener("click", () => {
+      const rows = readDownlinkRows();
+      const row = rows[Number(button.dataset.apply)];
+      row.mhz = ((Number(row.mhz) * 1e6 + Number(button.dataset.offset)) / 1e6).toFixed(6);
+      downlinkDraft = { code, rows };
+      rerender();
+      showStatus(`${row.name}: frequência corrigida no rascunho para ${row.mhz} MHz. Salve para valer.`);
     });
   }
   document.getElementById("dl-add").addEventListener("click", () => {
