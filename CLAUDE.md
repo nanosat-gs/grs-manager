@@ -15,7 +15,7 @@ os serviços são diferentes:
 | 4533 | TCP rotctld (hamlib) | **expõe** — para clientes tipo gpredict |
 | 5590 | HTTP (Flask + SSE) | **expõe** — o painel do operador |
 | 5580 | ZMQ REQ | **consome** — Station Manager |
-| 5591 | HTTP | **consome** — API de leitura do TC Scheduler |
+| 5591 | HTTP | **consome** — API do TC Scheduler: leitura do plano e as ações do operador (pular/forçar/desfazer passagem, recepção, downlinks) |
 
 ## O serviço que não conhece o banco
 
@@ -42,6 +42,7 @@ faz o JS da página não precisar saber que a fonte mudou:
 | Sem `TC_SCHEDULER_API_URL` | `from_environment()` devolve `None`; painel só de rotor |
 | Scheduler parado / timeout / 5xx | `{"satellites": [], "database_available": false}` |
 | HTTP 404 | `satellite_detail` devolve `None` — o painel faz o próprio 404 |
+| Ação do operador sem Scheduler | 503 com a mensagem "a ação não foi aplicada"; 400 e 404 do Scheduler chegam à tela como vieram |
 
 **404 é traduzido antes do `raise_for_status()`**, de propósito. "Esse satélite
 não existe" e "não deu para perguntar" são coisas diferentes na tela; confundi-
