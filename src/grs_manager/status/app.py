@@ -67,6 +67,7 @@ TC_GENERATOR_URL = os.getenv("TC_GENERATOR_URL", "http://localhost:5000")
 def create_app(
     station_manager_client: StationManagerZmqClient,
     station_data: Optional[Any] = None,
+    telemetry: Optional[Any] = None,
 ) -> Flask:
     app = Flask(__name__)
 
@@ -173,6 +174,15 @@ def create_app(
             return jsonify({"error": "informe satellite_code e aos"}), 400
         return operator_action(lambda: station_data.set_decision(
             body["satellite_code"], body["aos"], body.get("decision")))
+
+    @app.get("/api/telemetry/latest")
+    def telemetry_latest():
+        """O General Telemetry mais recente do FS-2, do grs-telemetry-decoder.
+        Mesmo contrato de /api/station: `configured` diz se há decodificador,
+        `available` se ele respondeu."""
+        if telemetry is None:
+            return jsonify({"configured": False, "available": False, "record": None})
+        return jsonify({**telemetry.latest("fs2", "general_telemetry"), "configured": True})
 
     @app.get("/")
     def status():

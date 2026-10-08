@@ -15,7 +15,7 @@ import threading
 from grs_manager.adapters.station_manager_zmq import StationManagerZmqClient
 from grs_manager.rotctld.server import RotctldServer
 from grs_manager.status.app import create_app
-from grs_manager.status import scheduler_client
+from grs_manager.status import scheduler_client, telemetry_client
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4533
@@ -54,7 +54,9 @@ def main() -> None:
         # papel que ela cumpre para o painel — só a fonte mudou, de uma
         # conexão com o Postgres para uma requisição ao TC Scheduler.
         station_data = scheduler_client.from_environment()
-        status_app = create_app(status_client, station_data)
+        # Também opcional: sem TELEMETRY_API_URL, a aba de telemetria diz que
+        # não há decodificador, e o resto do painel não muda.
+        status_app = create_app(status_client, station_data, telemetry_client.from_environment())
         status_thread = threading.Thread(
             target=status_app.run,
             # threaded=True é essencial aqui: a conexão SSE (/events) fica aberta

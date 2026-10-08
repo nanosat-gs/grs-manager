@@ -245,6 +245,7 @@
     <button class="tab active" data-view="satellites">Satélites</button>
     <button class="tab" data-view="passes">Passagens</button>
     <button class="tab" data-view="forecast">Previsão</button>
+    <button class="tab" data-view="telemetry">Telemetria</button>
   </div>
 
   <main>
@@ -273,6 +274,14 @@
       </div>
       <p id="forecast-toast" class="toast" hidden></p>
       <div id="forecast-table"><p class="empty">Carregando…</p></div>
+    </section>
+
+    <section id="telemetryView" class="panel-view">
+      <div class="section-head">
+        <h2>Última telemetria — FloripaSat-2</h2>
+        <span id="telemetry-meta" class="muted"></span>
+      </div>
+      <div id="telemetry-body"><p class="empty">Carregando…</p></div>
     </section>
   </main>
 
@@ -1008,10 +1017,82 @@ refreshButton.addEventListener("click", async () => {
   }
 });
 
+// --- Telemetria (grs-telemetry-decoder) ---------------------------------
+//
+// O decodificador manda cada campo com o valor cru, o legível e a unidade: o
+// painel só agrupa e desenha. Os grupos seguem as seções da spec (§4).
+
+const MISSION_FIELDS = new Set([
+  "obdh_main_edc", "obdh_main_payload_state", "obdh_sec_payload_state", "obdh_data_log_page",
+  "obdh_sbcd_page", "obdh_sensors_read_ts", "obdh_position_ts", "obdh_latitude", "obdh_longitude",
+  "obdh_altitude", "obdh_last_tle_update_ts", "obdh_last_contact_ts", "obdh_next_sched_tc_ts",
+  "obdh_tc_queue_size", "obdh_mode",
+]);
+
+function telemetryGroup(name) {
+  if (MISSION_FIELDS.has(name)) return "Missão e posição";
+  if (name.startsWith("eps_")) return "EPS";
+  if (name.startsWith("ttc_") || name.startsWith("antenna_")) return "TTC e antena";
+  return "OBDH";
+}
+
+function telemetryValue(field) {
+  if (field.value === null || field.value === undefined) return "—";
+  if (field.display_unit === "UTC") return stamp(field.value);
+  return `${field.value} ${field.display_unit}`.trim();
+}
+
+function renderTelemetry(payload) {
+  const body = document.getElementById("telemetry-body");
+  const meta = document.getElementById("telemetry-meta");
+
+  if (payload.configured === false) {
+    body.innerHTML = `<p class="notice">Painel sem decodificador: defina TELEMETRY_API_URL no
+      serviço grs-manager. O decodificador sobe com os profiles de recepção (rx, rxsim, rtlsdr).</p>`;
+    meta.textContent = "";
+    return;
+  }
+  if (!payload.available) {
+    body.innerHTML = `<p class="notice">Decodificador indisponível. Nenhum pacote se perde:
+      o cru fica no banco e é decodificado quando ele voltar.</p>`;
+    meta.textContent = "";
+    return;
+  }
+  const record = payload.record;
+  if (!record) {
+    body.innerHTML = `<p class="empty">Nenhum General Telemetry decodificado ainda.</p>`;
+    meta.textContent = "";
+    return;
+  }
+
+  const groups = new Map();
+  for (const field of record.fields) {
+    const group = telemetryGroup(field.name);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push([field.description || field.name, telemetryValue(field)]);
+  }
+  body.innerHTML = `<div class="panels">${[...groups].map(([g, rows]) => panel(g, rows)).join("")}</div>`;
+
+  const warning = record.radio_mismatch ? " · chegou pelo rádio errado" : "";
+  meta.textContent = `recebido ${relative(record.received_at)} pelo ${(record.radio || "?").toUpperCase()}` +
+    ` · relógio do satélite ${stamp(record.sat_time)} · layout ${record.layout}` +
+    ` · RS ${record.rs_errors} · raw packet ${record.raw_packet_id}${warning}`;
+}
+
+async function refreshTelemetry() {
+  try {
+    renderTelemetry(await (await fetch("/api/telemetry/latest")).json());
+  } catch (error) {
+    document.getElementById("telemetry-meta").textContent = "sem atualização";
+  }
+}
+
 refreshGrid();
 refreshForecast();
+refreshTelemetry();
 setInterval(refreshGrid, REFRESH_MS);
 setInterval(refreshForecast, REFRESH_MS);
+setInterval(refreshTelemetry, REFRESH_MS);
 setInterval(tickCountdowns, 1000);
 </script>
 </body>
